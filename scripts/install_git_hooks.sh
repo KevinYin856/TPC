@@ -10,10 +10,11 @@ cat > "${HOOK}" << 'EOF'
 if [ "${TPC_DISABLE_AUTO_PUSH:-0}" = "1" ]; then
   exit 0
 fi
-ROOT="$(git rev-parse --show-toplevel)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-echo "[tpc_agent] auto-push to origin/${BRANCH} ..."
-git push origin "${BRANCH}" || echo "[tpc_agent] push failed (稍后手动: bash scripts/sync_github.sh)"
+(
+  echo "[tpc_agent] auto-push to origin/${BRANCH} (background) ..."
+  git push origin "${BRANCH}" || echo "[tpc_agent] push failed (稍后手动: bash scripts/sync_github.sh)"
+) &
 EOF
 
 chmod +x "${HOOK}"
