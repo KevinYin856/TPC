@@ -78,3 +78,21 @@ bash scripts/setup_chinatravel_env.sh
 3. 验证：`python -c "from src.data_layer.world_env_client import get_chinatravel_status; print(get_chinatravel_status())"`
 
 有数据库后 planner 将使用真实 POI/交通，并满足票务、餐饮预算、酒店距离等约束。
+
+## 同步到 GitHub
+
+仓库：[KevinYin856/TPC](https://github.com/KevinYin856/TPC)
+
+```bash
+# 首次（已在本机 init 可跳过）
+bash scripts/setup_github_repo.sh
+
+# 手动同步
+bash scripts/sync_github.sh "你的提交说明"
+
+# 安装「每次 commit 后自动 push」钩子
+bash scripts/install_git_hooks.sh
+# 临时禁用自动推送: export TPC_DISABLE_AUTO_PUSH=1
+```
+
+推送前需已配置 GitHub 认证（HTTPS token 或 SSH）。`data/outputs/` 等大文件已在 `.gitignore` 中排除。
