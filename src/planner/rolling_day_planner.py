@@ -50,4 +50,7 @@ def rolling_horizon_plan(
     initial_plan.day_plans = day_plans
     initial_plan.metadata["official_plan"] = official
     initial_plan.metadata["plan_state"] = state
+    initial_plan.metadata["constraints"] = constraints
+    initial_plan.metadata["candidates"] = candidates
+    initial_plan.metadata["preferences"] = prefs
     return initial_plan

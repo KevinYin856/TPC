@@ -50,12 +50,25 @@ def semantic_grounding(
 
     cuisine_weights = map_cuisine_preferences(constraints, nl_text)
     pace_weight = map_pace(constraints, nl_text)
+    forbidden_attraction_types: list[str] = []
+    required_attraction_types: list[str] = []
+    forbidden_pois: list[str] = []
 
     # 预算约束 → 提高 budget_weight
     budget_weight = 0.5
     for card in constraints.cards:
         if card.category == "budget":
             budget_weight = 0.85
+        if card.category == "attraction":
+            params = card.parameters or {}
+            if params.get("must_visit_type"):
+                value = str(params["must_visit_type"])
+                required_attraction_types.append(value)
+                poi_weights[value] = max(poi_weights.get(value, 0), 2.0)
+            if params.get("forbidden_attraction_type"):
+                forbidden_attraction_types.append(str(params["forbidden_attraction_type"]))
+            if params.get("forbidden_poi"):
+                forbidden_pois.append(str(params["forbidden_poi"]))
 
     # 交通约束 → transport_weight
     transport_weight = 0.5
@@ -66,6 +79,12 @@ def semantic_grounding(
     tags: dict = {}
     if "local" in cuisine_weights:
         tags["cuisine_preference"] = "local"
+    if required_attraction_types:
+        tags["required_attraction_types"] = required_attraction_types
+    if forbidden_attraction_types:
+        tags["forbidden_attraction_types"] = forbidden_attraction_types
+    if forbidden_pois:
+        tags["forbidden_pois"] = forbidden_pois
 
     return GroundedPreferences(
         query_id=constraints.query_id,

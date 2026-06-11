@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from typing import Any
 
 from src.adapter.plan_formatter import build_empty_plan, format_official_plan, is_plan_success
@@ -70,5 +69,4 @@ def run_single_official_query(
             elapsed_sec=elapsed_sec,
             error=f"{type(exc).__name__}: {exc}",
         )
-        plan["_traceback"] = traceback.format_exc()
         return False, plan

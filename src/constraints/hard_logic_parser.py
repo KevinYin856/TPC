@@ -78,6 +78,64 @@ def _parse_single_snippet(snippet: str, base_idx: int) -> list[ConstraintCard]:
         )
         local_idx += 1
 
+    # 2.5) 必去景点名: result=({"Iron Statue Temple Water Street"}&attraction_name_set)
+    attraction_name_match = re.search(
+        r"\{\s*['\"]([^'\"]+)['\"]\s*\}\s*&\s*attraction_name_set",
+        snippet,
+    )
+    if attraction_name_match and "not" not in snippet.split("{", 1)[0].lower():
+        name = attraction_name_match.group(1)
+        cards.append(
+            build_constraint_card(
+                category="attraction",
+                description=f"必去景点: {name}",
+                parameters={"must_visit_poi": name, "dsl": snippet},
+                is_hard=True,
+                source="hard_logic_py",
+                card_id=f"hard_{local_idx}",
+            )
+        )
+        local_idx += 1
+
+    # 2.6) 必须包含景点类型: result=({"Museum/Memorial Hall"}<=attraction_type_set)
+    attraction_type_required = re.search(
+        r"\{\s*['\"]([^'\"]+)['\"]\s*\}\s*<=\s*attraction_type_set",
+        snippet,
+    )
+    if attraction_type_required:
+        atype = attraction_type_required.group(1)
+        cards.append(
+            build_constraint_card(
+                category="attraction",
+                description=f"必须包含景点类型: {atype}",
+                parameters={"must_visit_type": atype, "dsl": snippet},
+                is_hard=True,
+                source="hard_logic_py",
+                card_id=f"hard_{local_idx}",
+            )
+        )
+        local_idx += 1
+
+    # 2.7) 禁止景点类型: result=not({"red tourism sites"}&attraction_type_set)
+    attraction_type_forbidden = re.search(
+        r"not\s*\(\s*\{\s*['\"]([^'\"]+)['\"]\s*\}\s*&\s*attraction_type_set\s*\)",
+        snippet,
+        flags=re.IGNORECASE,
+    )
+    if attraction_type_forbidden:
+        atype = attraction_type_forbidden.group(1)
+        cards.append(
+            build_constraint_card(
+                category="attraction",
+                description=f"禁止景点类型: {atype}",
+                parameters={"forbidden_attraction_type": atype, "dsl": snippet},
+                is_hard=True,
+                source="hard_logic_py",
+                card_id=f"hard_{local_idx}",
+            )
+        )
+        local_idx += 1
+
     # 3) 餐饮预算: restaurant_cost<=1800
     dining_budget = re.search(r"restaurant_cost\s*<=\s*([\d.]+)", snippet)
     if dining_budget:
@@ -103,6 +161,22 @@ def _parse_single_snippet(snippet: str, base_idx: int) -> list[ConstraintCard]:
                 category="budget",
                 description=f"住宿总预算不超过 {amount}",
                 parameters={"budget_type": "accommodation", "max_cost": amount, "dsl": snippet},
+                is_hard=True,
+                source="hard_logic_py",
+                card_id=f"hard_{local_idx}",
+            )
+        )
+        local_idx += 1
+
+    # 4.5) 总预算: total_cost<=3000
+    total_budget = re.search(r"total_cost\s*<=\s*([\d.]+)", snippet)
+    if total_budget:
+        amount = float(total_budget.group(1))
+        cards.append(
+            build_constraint_card(
+                category="budget",
+                description=f"总预算不超过 {amount}",
+                parameters={"budget_type": "total", "max_cost": amount, "dsl": snippet},
                 is_hard=True,
                 source="hard_logic_py",
                 card_id=f"hard_{local_idx}",
@@ -162,7 +236,10 @@ def _parse_single_snippet(snippet: str, base_idx: int) -> list[ConstraintCard]:
         local_idx += 1
 
     # 7) 酒店类型约束: {"Free parking"}&accommodation_type_set
-    hotel_type_match = re.search(r"\{\"([^\"}]+)\"\}\s*&\s*accommodation_type_set", snippet)
+    hotel_type_match = re.search(
+        r"\{\s*['\"]([^'\"}]+)['\"]\s*\}\s*(?:&|<=)\s*accommodation_type_set",
+        snippet,
+    )
     if hotel_type_match:
         hotel_type = hotel_type_match.group(1)
         cards.append(

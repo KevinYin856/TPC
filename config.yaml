@@ -7,7 +7,7 @@ paths:
   data_processed: data/processed
   data_outputs: data/outputs
   verifier: null  # 官方 verifier 脚本路径，对接后填写
-  chinatravel_root: ../ChinaTravel  # ChinaTravel 仓库路径
+  chinatravel_root: ../ChinaTravel  # ChinaTravel 仓库路径（与 TPC 同级）
 
 planning:
   max_repair_rounds: 3
@@ -34,3 +34,8 @@ adapter:
   results_dir: data/outputs/results
   cache_dir: data/outputs/cache
   method_name: TPCAgent_TPCLLM
+
+# WorldEnv 后端选择（agent_env > direct > csv）
+world_env:
+  backend: auto             # auto | agent_env | direct | csv
+  agent_env_cwd: ../ChinaTravel  # agent_env adapter 所在目录

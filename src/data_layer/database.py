@@ -41,8 +41,10 @@ class TravelDatabase:
         """
         if sandbox_root is None:
             self.sandbox_root = resolve_data_path("data_raw", "data/raw") / "sandbox"
+            self._prefer_sandbox = False
         else:
             self.sandbox_root = Path(sandbox_root)
+            self._prefer_sandbox = True
 
         # 内存缓存：city -> category -> list[record]
         self._cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -91,6 +93,12 @@ class TravelDatabase:
             self._cache[city] = {}
         if category in self._cache[city]:
             return self._cache[city][category]
+
+        if self._prefer_sandbox:
+            file_path = self._resolve_category_path(city, category)
+            records = self._load_category_file(file_path)
+            self._cache[city][category] = records
+            return records
 
         # 优先 ChinaTravel CSV
         try:

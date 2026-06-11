@@ -26,9 +26,16 @@ class PlanningConstraints:
     taxi_cars: int | None = None
     innercity_modes: set[str] = field(default_factory=set)
     must_visit: list[str] = field(default_factory=list)
+    must_visit_types: list[str] = field(default_factory=list)
+    forbidden_attraction_types: list[str] = field(default_factory=list)
+    forbidden_pois: list[str] = field(default_factory=list)
+    cuisine_preferences: list[str] = field(default_factory=list)
     required_hotel_type: str | None = None
     prefer_metro: bool = True
     prefer_taxi_for_hotel: bool = True
+    pace: str = "balanced"
+    max_pois_per_day: int | None = None
+    buffer_minutes: int = 20
 
 
 def extract_planning_constraints(constraints: Constraints) -> PlanningConstraints:
@@ -102,8 +109,42 @@ def extract_planning_constraints(constraints: Constraints) -> PlanningConstraint
             if name not in pc.must_visit:
                 pc.must_visit.append(name)
 
+        elif card.category == "attraction" and params.get("must_visit_type"):
+            atype = str(params["must_visit_type"])
+            if atype not in pc.must_visit_types:
+                pc.must_visit_types.append(atype)
+
+        elif card.category == "attraction" and params.get("forbidden_attraction_type"):
+            atype = str(params["forbidden_attraction_type"])
+            if atype not in pc.forbidden_attraction_types:
+                pc.forbidden_attraction_types.append(atype)
+
+        elif card.category == "attraction" and params.get("forbidden_poi"):
+            name = str(params["forbidden_poi"])
+            if name not in pc.forbidden_pois:
+                pc.forbidden_pois.append(name)
+
         elif card.category == "accommodation" and params.get("required_type"):
             pc.required_hotel_type = str(params["required_type"])
+
+        elif card.category == "dietary" and params.get("cuisine_preference"):
+            cuisine = str(params["cuisine_preference"])
+            if cuisine not in pc.cuisine_preferences:
+                pc.cuisine_preferences.append(cuisine)
+
+        elif card.category == "preference":
+            if params.get("pace"):
+                pc.pace = str(params["pace"])
+            if params.get("max_pois_per_day") is not None:
+                try:
+                    pc.max_pois_per_day = int(params["max_pois_per_day"])
+                except (TypeError, ValueError):
+                    pass
+            if params.get("buffer_minutes") is not None:
+                try:
+                    pc.buffer_minutes = int(params["buffer_minutes"])
+                except (TypeError, ValueError):
+                    pass
 
         elif card.category == "people" and params.get("people_number"):
             try:

@@ -64,12 +64,7 @@ def format_official_plan(
 
     plan["elapsed_time(sec)"] = round(elapsed_sec, 3)
 
-    # 附加内部调试字段（不影响 schema 必需项校验）
-    if pipeline_result.get("score") is not None:
-        plan["_internal_score"] = pipeline_result["score"]
-    if pipeline_result.get("query_id"):
-        plan["_internal_query_id"] = pipeline_result["query_id"]
-
+    # Keep internal metadata out of the official submission payload.
     return plan
 
 

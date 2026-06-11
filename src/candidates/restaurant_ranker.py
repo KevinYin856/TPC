@@ -1,4 +1,4 @@
-"""餐厅排序：菜系偏好 + 餐饮预算。"""
+"""Restaurant ranking with cuisine preference and dining budget."""
 
 from __future__ import annotations
 
@@ -13,59 +13,51 @@ def rank_restaurants(
     constraints: Constraints | None = None,
     top_k: int = 30,
 ) -> list[POICandidate]:
-    """按菜系偏好、人均价格、餐饮预算排序餐厅。
-
-    Args:
-        restaurants: 原始餐厅列表。
-        preferences: 偏好权重（cuisine_weights）。
-        constraints: 可选，用于读取餐饮预算上限。
-        top_k: 保留数量。
-
-    Returns:
-        list[POICandidate]: 排序后餐厅候选。
-    """
     if not restaurants:
         return []
 
-    dining_budget = None
-    if constraints:
-        for card in constraints.cards:
-            if card.category == "budget" and card.parameters.get("budget_type") == "dining":
-                val = card.parameters.get("max_cost")
-                if val is not None:
-                    dining_budget = float(val)
+    dining_budget = _budget_limit(constraints, "dining")
+    required, forbidden = _cuisine_constraints(constraints)
+    people = int((constraints.global_params.get("people_number") if constraints else None) or 1)
+    days = int((constraints.global_params.get("days") if constraints else None) or 1)
+    meal_count = max(1, days * 3 - 1)
+    per_meal_budget = dining_budget / (meal_count * people) if dining_budget else None
 
     scored: list[tuple[float, dict[str, Any]]] = []
     for rest in restaurants:
+        if _matches_any(rest, forbidden):
+            continue
+        if required and not _matches_any(rest, required):
+            continue
+
         price = _float_price(rest)
         score = 1.0
-
-        # 菜系偏好匹配
         name = str(rest.get("name", ""))
         cuisine = str(rest.get("cuisine", rest.get("type", "")))
+
         for tag, weight in preferences.cuisine_weights.items():
             if tag.lower() in name.lower() or tag.lower() in cuisine.lower():
                 score += float(weight)
 
-        # 本地特色加分
-        if preferences.tags.get("cuisine_preference") == "local":
-            if any(kw in name for kw in ("本地", "特色", "老字号")):
-                score += 0.5
+        for tag in required:
+            if _matches_any(rest, [tag]):
+                score += 2.0
 
-        # 人均价格：预算紧张时偏好低价，预算宽松时可接受高价
-        if dining_budget is not None and dining_budget > 0:
-            # 假设每天 3 餐，估算人均单餐预算
-            days = (constraints.global_params.get("days") if constraints else None) or 3
-            people = (constraints.global_params.get("people_number") if constraints else None) or 1
-            per_meal_budget = dining_budget / (days * people * 3)
+        if preferences.tags.get("cuisine_preference") == "local":
+            if _looks_local(rest):
+                score += 0.8
+
+        if per_meal_budget is not None:
             if price <= per_meal_budget:
-                score += 1.0
+                score += 1.2
             elif price <= per_meal_budget * 1.5:
                 score += 0.3
             else:
-                score -= 0.5
+                score -= min(2.0, (price - per_meal_budget) / max(per_meal_budget, 1.0))
+        else:
+            score += max(0.0, 1.0 - price / 250.0)
 
-        rating = rest.get("rating")
+        rating = rest.get("rating") or rest.get("score")
         if rating is not None:
             try:
                 score += float(rating) * 0.3
@@ -74,19 +66,52 @@ def rank_restaurants(
 
         scored.append((score, rest))
 
-    scored.sort(key=lambda x: -x[0])
-    result: list[POICandidate] = []
-    for score, rest in scored[:top_k]:
-        result.append(
-            POICandidate(
-                poi_id=_rest_id(rest),
-                name=str(rest.get("name", "")),
-                score=round(score, 4),
-                region=str(rest.get("region", "")),
-                metadata=dict(rest),
-            )
+    scored.sort(key=lambda x: (-x[0], _float_price(x[1])))
+    return [
+        POICandidate(
+            poi_id=_rest_id(rest),
+            name=str(rest.get("name", "")),
+            score=round(score, 4),
+            region=str(rest.get("region", rest.get("district", ""))),
+            metadata=dict(rest),
         )
-    return result
+        for score, rest in scored[:top_k]
+    ]
+
+
+def _budget_limit(constraints: Constraints | None, budget_type: str) -> float | None:
+    if constraints is None:
+        return None
+    for card in constraints.cards:
+        if card.category == "budget" and card.parameters.get("budget_type") == budget_type:
+            val = card.parameters.get("max_cost")
+            if val is not None:
+                return float(val)
+    return None
+
+
+def _cuisine_constraints(constraints: Constraints | None) -> tuple[list[str], list[str]]:
+    required: list[str] = []
+    forbidden: list[str] = []
+    if constraints is None:
+        return required, forbidden
+    for card in constraints.cards:
+        params = card.parameters or {}
+        if card.category == "dietary" and params.get("cuisine_preference"):
+            required.append(str(params["cuisine_preference"]))
+        if card.category == "dietary" and params.get("forbidden_cuisine"):
+            forbidden.append(str(params["forbidden_cuisine"]))
+    return required, forbidden
+
+
+def _matches_any(rest: dict[str, Any], values: list[str]) -> bool:
+    haystack = " ".join(str(rest.get(k, "")) for k in ("name", "cuisine", "type", "recommendedfood")).lower()
+    return any(v.lower() in haystack for v in values)
+
+
+def _looks_local(rest: dict[str, Any]) -> bool:
+    haystack = " ".join(str(rest.get(k, "")) for k in ("name", "cuisine", "recommendedfood")).lower()
+    return any(k in haystack for k in ("local", "sichuan", "cuisine", "tea", "hotpot", "老字号", "特色"))
 
 
 def _rest_id(rest: dict[str, Any]) -> str:
@@ -103,4 +128,4 @@ def _float_price(record: dict[str, Any]) -> float:
                 return float(record[key])
             except (TypeError, ValueError):
                 pass
-    return 50.0  # 无价格时用默认值
+    return 50.0

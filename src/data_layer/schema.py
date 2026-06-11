@@ -161,6 +161,7 @@ class ErrorType(str, Enum):
     BUDGET = "budget"
     TIME = "time"
     TRANSPORT = "transport"
+    TICKET = "ticket"
     MEAL = "meal"
     MUST_VISIT = "must_visit"
     FORMAT = "format"
@@ -205,3 +206,50 @@ class SearchResult:
     best_plan: OfficialPlan
     best_score: float
     all_candidates: list[tuple[OfficialPlan, float, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Active Constraint Mapping (Active SLAM upgrade)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConstraintBelief:
+    """单个约束维度的 belief state。"""
+
+    category: str
+    resolved: bool = False             # 是否已完全澄清
+    confidence: float = 0.0            # 当前置信度 0-1
+    missing_data: list[str] = field(default_factory=list)  # 缺失的数据类型
+    risk_level: float = 0.0            # 该维度错误风险
+    last_query_result: dict[str, Any] = field(default_factory=dict)  # 最近一次查询结果摘要
+
+
+@dataclass
+class ActiveAction:
+    """主动查询动作 — 对应一条 agent_env structured tool call。"""
+
+    action_id: str
+    tool_name: str                     # agent_env tool name (goto, attractions_nearby, ...)
+    params: dict[str, Any] = field(default_factory=dict)
+    target_category: str = ""          # 目标约束维度
+    risk_reason: str = ""              # 为什么需要查这个
+    expected_info_gain: float = 0.0
+    query_cost: float = 0.0
+    priority_score: float = 0.0        # info_gain / (cost + epsilon)
+    selected: bool = False             # 是否被选中执行
+    selection_reason: str = ""         # 选中/未选中原因
+    expected_output_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ActionSelectionResult:
+    """一次 active constraint mapping 的完整结果。"""
+
+    query_id: str
+    beliefs: dict[str, ConstraintBelief] = field(default_factory=dict)   # category → belief
+    all_actions: list[ActiveAction] = field(default_factory=list)         # 所有候选动作
+    selected_actions: list[ActiveAction] = field(default_factory=list)    # 被选中的动作
+    rejected_actions: list[ActiveAction] = field(default_factory=list)    # 被拒绝的动作
+    total_expected_gain: float = 0.0
+    total_query_cost: float = 0.0
+    explanation_summary: list[str] = field(default_factory=list)

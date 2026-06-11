@@ -1,11 +1,11 @@
-"""POI 排序：Top-K + MMR 多样性选择。"""
+"""POI ranking: hard filtering + preference score + MMR diversity."""
 
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from src.data_layer.schema import GroundedPreferences, POICandidate
+from src.data_layer.schema import Constraints, GroundedPreferences, POICandidate
 
 
 def rank_pois(
@@ -13,41 +13,36 @@ def rank_pois(
     preferences: GroundedPreferences,
     top_k: int = 50,
     must_visit_ids: set[str] | None = None,
+    constraints: Constraints | None = None,
 ) -> list[POICandidate]:
-    """对景点 POI 打分排序，并用 MMR 保证区域多样性。
+    """Rank attractions and keep a diverse top-k candidate set.
 
-    评分因素：
-        1. preferences.poi_weights 中按名称/id 的权重；
-        2. POI 自身 rating / popularity（若有）；
-        3. 必去景点强制置顶；
-        4. MMR 惩罚同 region 过度集中。
-
-    Args:
-        pois: 原始 POI 字典列表。
-        preferences: 语义落地偏好权重。
-        top_k: 保留数量。
-        must_visit_ids: 必去 POI ID 集合，保证进入候选池。
-
-    Returns:
-        list[POICandidate]: 排序后候选，长度 <= top_k。
+    The travel-planning migration point is here: hard obstacles such as forbidden
+    attraction types are removed; must-visit POIs/types get very high priority;
+    soft preferences and price/ratings shape the remaining search space.
     """
     if not pois:
         return []
 
     must_visit_ids = must_visit_ids or set()
+    required_types, forbidden_types, forbidden_names = _extract_type_constraints(constraints)
     scored: list[tuple[float, dict[str, Any]]] = []
 
     for poi in pois:
         poi_id = _poi_id(poi)
         name = str(poi.get("name", ""))
+        if _is_forbidden_poi(poi, forbidden_types, forbidden_names):
+            continue
+
         base = _base_poi_score(poi, preferences, name, poi_id)
-        if poi_id in must_visit_ids:
-            base += 1000.0  # 必去项绝对优先
+        if poi_id in must_visit_ids or name in must_visit_ids:
+            base += 1000.0
+        if required_types and _matches_any_type(poi, required_types):
+            base += 500.0
         scored.append((base, poi))
 
     scored.sort(key=lambda x: -x[0])
 
-    # MMR 选择：在高分 POI 中避免同一 region 过度堆叠
     selected: list[POICandidate] = []
     selected_regions: list[str] = []
     lambda_mmr = 0.7
@@ -55,14 +50,12 @@ def rank_pois(
     while scored and len(selected) < top_k:
         best_idx = 0
         best_mmr = -math.inf
-
         for idx, (rel_score, poi) in enumerate(scored):
             region = _region_of(poi)
-            diversity_penalty = 0.0
+            same_region_ratio = 0.0
             if selected_regions:
-                same = sum(1 for r in selected_regions if r == region)
-                diversity_penalty = same / len(selected_regions)
-            mmr = lambda_mmr * rel_score - (1 - lambda_mmr) * diversity_penalty * rel_score
+                same_region_ratio = sum(1 for r in selected_regions if r == region) / len(selected_regions)
+            mmr = lambda_mmr * rel_score - (1 - lambda_mmr) * same_region_ratio * rel_score
             if mmr > best_mmr:
                 best_mmr = mmr
                 best_idx = idx
@@ -83,8 +76,28 @@ def rank_pois(
     return selected
 
 
+def _extract_type_constraints(
+    constraints: Constraints | None,
+) -> tuple[list[str], list[str], list[str]]:
+    if constraints is None:
+        return [], [], []
+    required: list[str] = []
+    forbidden_types: list[str] = []
+    forbidden_names: list[str] = []
+    for card in constraints.cards:
+        if card.category != "attraction":
+            continue
+        params = card.parameters or {}
+        if params.get("must_visit_type"):
+            required.append(str(params["must_visit_type"]))
+        if params.get("forbidden_attraction_type"):
+            forbidden_types.append(str(params["forbidden_attraction_type"]))
+        if params.get("forbidden_poi"):
+            forbidden_names.append(str(params["forbidden_poi"]))
+    return required, forbidden_types, forbidden_names
+
+
 def _poi_id(poi: dict[str, Any]) -> str:
-    """提取 POI 唯一 ID。"""
     for key in ("id", "poi_id", "uid", "name"):
         if poi.get(key):
             return str(poi[key])
@@ -92,13 +105,37 @@ def _poi_id(poi: dict[str, Any]) -> str:
 
 
 def _region_of(poi: dict[str, Any]) -> str:
-    """提取或推断 POI 所属区域（用于 MMR 多样性）。"""
     for key in ("region", "district", "area"):
         if poi.get(key):
             return str(poi[key])
-    # 无区域字段时用名称前两字作为粗粒度区域
     name = str(poi.get("name", ""))
     return name[:2] if len(name) >= 2 else "default"
+
+
+def _poi_type(poi: dict[str, Any]) -> str:
+    return str(poi.get("type") or poi.get("category") or poi.get("tags") or "")
+
+
+def _matches_type(poi: dict[str, Any], wanted: str) -> bool:
+    wanted_l = wanted.lower()
+    type_l = _poi_type(poi).lower()
+    name_l = str(poi.get("name", "")).lower()
+    return wanted_l in type_l or type_l in wanted_l or wanted_l in name_l
+
+
+def _matches_any_type(poi: dict[str, Any], wanted_types: list[str]) -> bool:
+    return any(_matches_type(poi, t) for t in wanted_types)
+
+
+def _is_forbidden_poi(
+    poi: dict[str, Any],
+    forbidden_types: list[str],
+    forbidden_names: list[str],
+) -> bool:
+    name_l = str(poi.get("name", "")).lower()
+    if any(n.lower() in name_l for n in forbidden_names):
+        return True
+    return any(_matches_type(poi, t) for t in forbidden_types)
 
 
 def _base_poi_score(
@@ -107,15 +144,12 @@ def _base_poi_score(
     name: str,
     poi_id: str,
 ) -> float:
-    """计算 POI 基础相关度分数。"""
     score = 1.0
 
-    # 偏好权重表匹配
     for key, weight in preferences.poi_weights.items():
-        if key in name or key == poi_id:
+        if key and (key in name or key == poi_id):
             score += float(weight)
 
-    # 评分 / 热度
     rating = poi.get("rating") or poi.get("score")
     if rating is not None:
         try:
@@ -130,11 +164,12 @@ def _base_poi_score(
         except (TypeError, ValueError):
             pass
 
-    # 免费景点在预算紧张时略加分（由 pace/budget 权重间接体现）
     price = poi.get("price") or poi.get("cost") or 0
     try:
         if float(price) == 0:
             score += preferences.budget_weight * 0.2
+        elif preferences.budget_weight > 0.7:
+            score -= min(1.0, float(price) / 200.0)
     except (TypeError, ValueError):
         pass
 

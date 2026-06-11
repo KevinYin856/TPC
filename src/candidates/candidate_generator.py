@@ -93,6 +93,7 @@ def build_candidates(
         preferences,
         top_k=cfg["top_k_pois"],
         must_visit_ids=must_visit_ids,
+        constraints=constraints,
     )
     hotel_candidates = rank_hotels(
         raw_hotels,

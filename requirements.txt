@@ -10,3 +10,6 @@ loguru>=0.7.2
 func-timeout>=4.3.5
 geopy>=2.4.0
 pandas>=2.0.0
+datasets>=2.14.0
+tqdm>=4.66.0
+jsonschema>=4.23.0

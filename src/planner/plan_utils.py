@@ -2,13 +2,52 @@
 
 from __future__ import annotations
 
+import re
+import warnings
 from typing import Any
 
+# 官方 schema 要求 start_time/end_time 必须是 HH:MM（两位小时）
+_TIME_PATTERN = re.compile(r"^\d{2}:\d{2}$")
+_MAX_MINUTES = 24 * 60  # 一天最大分钟数
 
-def add_minutes(time_str: str, minutes: int) -> str:
-    """HH:MM 加分钟。"""
-    h, m = map(int, time_str.split(":"))
+
+def _validate_time_format(time_str: str, context: str = "") -> None:
+    """校验时间格式是否为 HH:MM；三位数小时会触发 RuntimeError（fail fast）。"""
+    if not _TIME_PATTERN.match(time_str):
+        msg = f"时间格式违规: {time_str!r}"
+        if context:
+            msg = f"{msg} ({context})"
+        raise RuntimeError(msg)
+
+
+def is_valid_time_format(time_str: str) -> bool:
+    """返回时间字符串是否符合 ^\\d{2}:\\d{2}$ schema。"""
+    return bool(_TIME_PATTERN.match(time_str))
+
+
+def add_minutes(time_str: str, minutes: int, *, allow_overflow: bool = False) -> str:
+    """HH:MM 加分钟。
+
+    Args:
+        time_str: 起始时间（HH:MM）。
+        minutes: 增加的分钟数（可为负）。
+        allow_overflow: True 时允许跨过 23:59（城际交通专用）；默认 False 时
+            超过 23:59 会抛出 RuntimeError（不在底层吞掉排程错误）。
+    """
+    try:
+        h, m = map(int, time_str.split(":"))
+    except (ValueError, AttributeError):
+        raise ValueError(f"add_minutes: 无法解析时间 {time_str!r}") from None
     total = h * 60 + m + minutes
+    if total >= _MAX_MINUTES:
+        if allow_overflow:
+            return f"{total // 60:02d}:{total % 60:02d}"
+        raise RuntimeError(
+            f"排程不可行: {time_str} + {minutes}min = "
+            f"{total // 60:02d}:{total % 60:02d} 超出当天 23:59"
+        )
+    if total < 0:
+        raise RuntimeError(f"排程不可行: {time_str} + {minutes}min = 负时间")
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
@@ -31,19 +70,26 @@ def annotate_transports(
     people: int,
     taxi_cars: int | None = None,
 ) -> list[dict[str, Any]]:
-    """补全官方 transport 字段：price / tickets / cars。"""
+    """补全官方 transport 字段：price=单价, cost=单价*tickets/cars, tickets/cars。"""
     cars = taxi_cars if taxi_cars is not None else max(1, (people + 3) // 4)
     result: list[dict[str, Any]] = []
     for seg in segments:
         item = dict(seg)
-        item.setdefault("price", item.get("cost", 0))
-        item.setdefault("cost", item.get("price", 0))
         item.setdefault("distance", item.get("distance", 0.0))
         mode = item.get("mode", "")
+        # per-unit price
+        unit_price = float(item.get("price", item.get("cost", 0)))
         if mode == "metro":
             item["tickets"] = people
+            item["price"] = unit_price
+            item["cost"] = round(unit_price * people, 2)
         elif mode == "taxi":
             item["cars"] = cars
+            item["price"] = unit_price
+            item["cost"] = round(unit_price * cars, 2)
+        else:  # walk
+            item["price"] = 0.0
+            item["cost"] = 0.0
         result.append(item)
     return result
 
@@ -94,9 +140,15 @@ def make_intercity_activity(row: dict, people: int, is_return: bool = False) -> 
 
     extra: dict[str, Any] = {"start": start, "end": end}
     if mode == "airplane":
-        extra["FlightID"] = str(row.get("FlightID") or row.get("FlightId") or f"FL_{start}_{end}")
+        fid = row.get("FlightID") or row.get("FlightId") or ""
+        if not fid:
+            raise ValueError(f"城际航班缺少 FlightID: {start}->{end}，拒绝伪造")
+        extra["FlightID"] = str(fid)
     else:
-        extra["TrainID"] = str(row.get("TrainID") or row.get("TrainId") or f"TR_{start}_{end}")
+        tid = row.get("TrainID") or row.get("TrainId") or ""
+        if not tid:
+            raise ValueError(f"城际火车缺少 TrainID: {start}->{end}，拒绝伪造")
+        extra["TrainID"] = str(tid)
 
     return make_activity(
         act_type=mode,

@@ -81,8 +81,8 @@ def is_chinatravel_database_ready(lang: str | None = None) -> bool:
     db = database_dir(lang)
     if db is None:
         return False
-    sample = db / "attractions" / "chengdu" / "attractions.csv"
-    return sample.exists()
+    sample_dir = db / "attractions" / "chengdu"
+    return sample_dir.exists() and any(sample_dir.glob("*.csv"))
 
 
 def city_slug(city: str) -> str | None:
@@ -110,16 +110,15 @@ def load_csv_records(city: str, category: str, lang: str | None = None) -> list[
         "restaurant": "restaurants",
     }
     folder = folder_map.get(category, category)
-    csv_path = db / folder / slug / f"{folder.rstrip('s') if folder.endswith('s') else folder}.csv"
-    # 修正路径: attractions/chengdu/attractions.csv
-    if folder == "attractions":
-        csv_path = db / "attractions" / slug / "attractions.csv"
-    elif folder == "accommodations":
-        csv_path = db / "accommodations" / slug / "accommodations.csv"
-    elif folder == "restaurants":
-        csv_path = db / "restaurants" / slug / "restaurants.csv"
-
-    if not csv_path.exists():
+    city_dir = db / folder / slug
+    csv_candidates = [
+        city_dir / f"{folder}.csv",
+        city_dir / f"{folder}_{slug}.csv",
+        city_dir / f"{folder.rstrip('s')}.csv",
+        city_dir / f"{folder.rstrip('s')}_{slug}.csv",
+    ]
+    csv_path = next((p for p in csv_candidates if p.exists()), None)
+    if csv_path is None:
         return []
 
     records: list[dict[str, Any]] = []
@@ -130,7 +129,7 @@ def load_csv_records(city: str, category: str, lang: str | None = None) -> list[
             item.setdefault("name", item.get("name", ""))
             item.setdefault("city", city)
             item.setdefault("category", category)
-            for key in ("price", "lat", "lon", "id"):
+            for key in ("price", "lat", "lon", "lng", "id", "recommendmintime", "recommendmaxtime"):
                 if key in item and item[key] not in ("", None):
                     try:
                         if key == "id":

@@ -14,6 +14,7 @@ from src.planner.constraint_profile import (
 )
 from src.planner.plan_utils import (
     add_minutes,
+    is_valid_time_format,
     make_activity,
     make_intercity_activity,
     max_time,
@@ -100,8 +101,10 @@ def _select_hotel(
         if filtered:
             pool = filtered
 
+    rooms = max(1, (pc.people + 1) // 2)
+    nights = max(1, pc.days - 1)
     if pc.accommodation_budget is not None:
-        affordable = [h for h in pool if _poi_price(h, 9999) * max(1, (pc.people + 1) // 2) <= pc.accommodation_budget]
+        affordable = [h for h in pool if _poi_price(h, 9999) * rooms * nights <= pc.accommodation_budget]
         if affordable:
             pool = affordable
 
@@ -113,7 +116,7 @@ def _select_restaurants(
     pc: PlanningConstraints,
     restaurants: list[POICandidate],
 ) -> tuple[POICandidate | None, POICandidate | None, POICandidate | None]:
-    """返回 (breakfast, lunch, dinner) 候选；无数据时用占位。"""
+    """返回 (breakfast, lunch, dinner) 候选，三餐不重复。"""
     if not restaurants:
         placeholder = POICandidate(
             poi_id="meal_default",
@@ -130,9 +133,18 @@ def _select_restaurants(
             affordable = sorted(restaurants, key=lambda r: _poi_price(r))[:5]
 
     affordable = sorted(affordable, key=lambda r: _poi_price(r))
-    cheap = affordable[0]
-    mid = affordable[len(affordable) // 2] if len(affordable) > 1 else cheap
-    return cheap, mid, mid
+    # 选三个不同餐厅（breakfast / lunch / dinner 不重复）
+    if len(affordable) >= 3:
+        breakfast_r = affordable[0]
+        lunch_r = affordable[1]
+        dinner_r = affordable[2]
+    elif len(affordable) == 2:
+        breakfast_r = affordable[0]
+        lunch_r = affordable[1]
+        dinner_r = affordable[0]
+    else:
+        breakfast_r = lunch_r = dinner_r = affordable[0]
+    return breakfast_r, lunch_r, dinner_r
 
 
 def _pick_pois_per_day(
@@ -142,33 +154,127 @@ def _pick_pois_per_day(
     policy: str,
     pace_weight: float,
 ) -> list[list[POICandidate]]:
+    """Rolling task allocation: choose each day from current remaining state."""
     if not pois or num_days <= 0:
         return [[] for _ in range(max(num_days, 1))]
 
-    must_names = set(pc.must_visit)
-    must = [p for p in pois if p.name in must_names or p.poi_id in must_names]
-    others = [p for p in pois if p not in must]
-    ordered = must + sorted(others, key=lambda p: -p.score)
+    remaining = [p for p in pois if _poi_allowed(p, pc)]
+    must = [p for p in remaining if _is_must_poi(p, pc)]
+    others = [p for p in remaining if p not in must]
 
-    if policy == "preference" or pace_weight > 0.6:
-        per_day = 3
-    elif policy == "safe" or pace_weight < 0.4:
-        per_day = 2
+    if policy == "budget":
+        others.sort(key=lambda p: (_poi_price(p, 0.0), -p.score))
     else:
-        per_day = 2
-    per_day = min(per_day, max(1, len(ordered) // max(num_days, 1) + 1))
+        others.sort(key=lambda p: -p.score)
 
-    days: list[list[POICandidate]] = [[] for _ in range(num_days)]
-    idx = 0
-    for d in range(num_days):
-        for _ in range(per_day):
-            if idx < len(ordered):
-                days[d].append(ordered[idx])
-                idx += 1
-    while idx < len(ordered):
-        days[idx % num_days].append(ordered[idx])
-        idx += 1
+    ordered_remaining = _dedupe_candidates(must + others)
+    days: list[list[POICandidate]] = []
+    current_anchor: POICandidate | None = None
+
+    for day_idx in range(num_days):
+        capacity = _daily_capacity(policy, pace_weight, pc, is_final_day=day_idx == num_days - 1)
+        day_items: list[POICandidate] = []
+
+        while ordered_remaining and len(day_items) < capacity:
+            if policy == "low_transport":
+                idx = _nearest_candidate_index(current_anchor or (day_items[-1] if day_items else None), ordered_remaining)
+            elif policy == "must_visit_first":
+                idx = 0
+            else:
+                idx = _best_candidate_index(ordered_remaining, policy)
+            chosen = ordered_remaining.pop(idx)
+            day_items.append(chosen)
+            current_anchor = chosen
+
+        days.append(day_items)
+
     return days
+
+
+def _daily_capacity(policy: str, pace_weight: float, pc: PlanningConstraints, *, is_final_day: bool) -> int:
+    if pc.max_pois_per_day:
+        cap = pc.max_pois_per_day
+    elif policy == "safe" or pc.pace == "relaxed" or pace_weight < 0.4:
+        cap = 2
+    elif policy == "preference" or pc.pace == "intensive" or pace_weight > 0.6:
+        cap = 4
+    else:
+        cap = 3
+    if policy == "budget":
+        cap = min(cap, 2)
+    if is_final_day:
+        cap = max(1, cap - 1)
+    return max(1, cap)
+
+
+def _dedupe_candidates(items: list[POICandidate]) -> list[POICandidate]:
+    seen: set[str] = set()
+    out: list[POICandidate] = []
+    for item in items:
+        key = item.poi_id or item.name
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _poi_allowed(poi: POICandidate, pc: PlanningConstraints) -> bool:
+    name_l = poi.name.lower()
+    ptype = str((poi.metadata or {}).get("type", "")).lower()
+    if any(f.lower() in name_l for f in pc.forbidden_pois):
+        return False
+    return not any(f.lower() in ptype or f.lower() in name_l for f in pc.forbidden_attraction_types)
+
+
+def _is_must_poi(poi: POICandidate, pc: PlanningConstraints) -> bool:
+    name_l = poi.name.lower()
+    pid_l = poi.poi_id.lower()
+    ptype = str((poi.metadata or {}).get("type", "")).lower()
+    if any(m.lower() in name_l or m.lower() == pid_l for m in pc.must_visit):
+        return True
+    return any(t.lower() in ptype or t.lower() in name_l for t in pc.must_visit_types)
+
+
+def _best_candidate_index(candidates: list[POICandidate], policy: str) -> int:
+    if policy == "budget":
+        return min(range(len(candidates)), key=lambda i: (_poi_price(candidates[i], 0.0), -candidates[i].score))
+    return max(range(len(candidates)), key=lambda i: candidates[i].score)
+
+
+def _nearest_candidate_index(anchor: POICandidate | None, candidates: list[POICandidate]) -> int:
+    if anchor is None:
+        return 0
+    return min(range(len(candidates)), key=lambda i: _candidate_distance(anchor, candidates[i]))
+
+
+def _candidate_distance(a: POICandidate, b: POICandidate) -> float:
+    ca, cb = _coords(a.metadata or {}), _coords(b.metadata or {})
+    if ca and cb:
+        r = 6371.0
+        import math
+
+        phi1, phi2 = math.radians(ca[0]), math.radians(cb[0])
+        dphi = math.radians(cb[0] - ca[0])
+        dlambda = math.radians(cb[1] - ca[1])
+        x = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+        return 2 * r * math.asin(math.sqrt(x))
+    if a.region and b.region and a.region == b.region:
+        return 0.5
+    return 5.0
+
+
+def _coords(rec: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        if "latitude" in rec and "longitude" in rec:
+            return float(rec["latitude"]), float(rec["longitude"])
+        if "lat" in rec and "lon" in rec:
+            return float(rec["lat"]), float(rec["lon"])
+        if "lat" in rec and "lng" in rec:
+            return float(rec["lat"]), float(rec["lng"])
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _intercity_end_position(row: dict[str, Any], target_city: str) -> str:
@@ -224,17 +330,23 @@ def _append_meal(
     price = _poi_price(restaurant, 35.0 if meal_type == "breakfast" else 50.0)
     duration = 45 if meal_type == "breakfast" else 60
     if restaurant and not sandbox.is_restaurant_open(pc.target_city, name, current_time):
-        current_time = max_time(current_time, "11:30" if meal_type == "lunch" else "17:30")
+        meal_open_hint = {"breakfast": "07:30", "lunch": "11:30", "dinner": "17:30"}
+        current_time = max_time(current_time, meal_open_hint.get(meal_type, "11:30"))
 
-    transports, arrive = _goto(sandbox, pc, pc.target_city, pos, name, current_time)
-    t_start = transports[0]["start_time"] if transports else current_time
-    t_end = add_minutes(arrive, duration)
-    activities.append(make_activity(
-        meal_type, t_start, t_end,
-        price * pc.people, price, transports,
-        position=name, tickets=pc.people,
-    ))
-    return name, add_minutes(t_end, 10)
+    try:
+        transports, arrive = _goto(sandbox, pc, pc.target_city, pos, name, current_time)
+        t_start = transports[0]["start_time"] if transports else current_time
+        t_end = add_minutes(arrive, duration)
+        activities.append(make_activity(
+            meal_type, t_start, t_end,
+            price * pc.people, price, transports,
+            position=name, tickets=pc.people,
+        ))
+        next_time = add_minutes(t_end, 10)
+        return name, next_time
+    except RuntimeError:
+        # 时间溢出：跳过此餐
+        return pos, current_time
 
 
 def build_day_activities(
@@ -257,72 +369,99 @@ def build_day_activities(
     breakfast_r, lunch_r, dinner_r = meals
 
     if not skip_breakfast:
-        pos, current_time = _append_meal(
-            activities, "breakfast", breakfast_r, sandbox, pc, pos, current_time,
-            f"{target} Breakfast Spot",
-        )
+        try:
+            pos, current_time = _append_meal(
+                activities, "breakfast", breakfast_r, sandbox, pc, pos, current_time,
+                f"{target} Breakfast Spot",
+            )
+        except RuntimeError:
+            pass  # 早餐排不下，继续
     elif pos and time_to_minutes(current_time) < time_to_minutes("11:00"):
         current_time = "11:00"
 
     if not day_pois:
-        pos, current_time = _append_meal(
-            activities, "lunch", lunch_r, sandbox, pc, pos, current_time,
-            f"{target} Lunch Spot",
-        )
+        try:
+            pos, current_time = _append_meal(
+                activities, "lunch", lunch_r, sandbox, pc, pos, current_time,
+                f"{target} Lunch Spot",
+            )
+        except RuntimeError:
+            pass
 
+    skipped_pois = 0
     for i, poi in enumerate(day_pois):
         visit_min = 90
         meta = poi.metadata or {}
         if meta.get("recommendmintime"):
             try:
-                visit_min = int(float(meta["recommendmintime"]) * 60)
+                visit_min = max(45, int(float(meta["recommendmintime"]) * 60))
             except (TypeError, ValueError):
                 pass
+
+        # 时间预算检查：估算本景点是否会溢出
+        try:
+            _ = add_minutes(current_time, 30 + visit_min + 15)  # ballpark check
+        except RuntimeError:
+            skipped_pois += 1
+            continue  # 跳过此 POI，不强行塞入
 
         if not sandbox.is_attraction_open(target, poi.name, current_time):
             current_time = max_time(current_time, "09:30")
 
-        transports, arrive = _goto(sandbox, pc, target, pos, poi.name, current_time)
-        t_start = transports[0]["start_time"] if transports else current_time
-        t_end = add_minutes(arrive, visit_min)
-        price = _poi_price(poi, 0.0)
-        activities.append(make_activity(
-            "attraction", t_start, t_end,
-            price * pc.people, price, transports,
-            position=poi.name, tickets=pc.activity_tickets or pc.people,
-        ))
-        pos = poi.name
-        current_time = add_minutes(t_end, 15)
+        try:
+            transports, arrive = _goto(sandbox, pc, target, pos, poi.name, current_time)
+            t_start = transports[0]["start_time"] if transports else current_time
+            t_end = add_minutes(arrive, visit_min)
+            price = _poi_price(poi, 0.0)
+            activities.append(make_activity(
+                "attraction", t_start, t_end,
+                price * pc.people, price, transports,
+                position=poi.name, tickets=pc.activity_tickets or pc.people,
+            ))
+            pos = poi.name
+            current_time = add_minutes(t_end, pc.buffer_minutes)
+        except RuntimeError:
+            skipped_pois += 1
+            continue  # 时间溢出，跳过此 POI
 
         if i == 0:
-            pos, current_time = _append_meal(
-                activities, "lunch", lunch_r, sandbox, pc, pos, current_time,
-                f"{target} Lunch Spot",
-            )
+            try:
+                pos, current_time = _append_meal(
+                    activities, "lunch", lunch_r, sandbox, pc, pos, current_time,
+                    f"{target} Lunch Spot",
+                )
+            except RuntimeError:
+                pass  # 午餐排不下就算了
 
-    pos, current_time = _append_meal(
-        activities, "dinner", dinner_r, sandbox, pc, pos,
-        max_time(current_time, "17:30"),
-        f"{target} Dinner Spot",
-    )
+    try:
+        pos, current_time = _append_meal(
+            activities, "dinner", dinner_r, sandbox, pc, pos,
+            max_time(current_time, "17:30"),
+            f"{target} Dinner Spot",
+        )
+    except RuntimeError:
+        pass  # 晚餐排不下，跳过
 
     if day_index < num_days and hotel:
-        at0 = max_time(current_time, "20:00")
-        hp = _poi_price(hotel, 300.0)
-        transports, arrive = _goto(
-            sandbox, pc, target, pos, hotel.name, at0, use_taxi=True,
-        )
-        at1 = add_minutes(arrive, 60)
-        if time_to_minutes(at1) <= time_to_minutes(at0):
-            at1 = add_minutes(at0, 120)
-        rooms = max(1, (pc.people + 1) // 2)
-        activities.append(make_activity(
-            "accommodation", at0, at1,
-            hp * rooms, hp, transports,
-            position=hotel.name, tickets=pc.people,
-            extra={"rooms": rooms, "room_type": 1},
-        ))
-        pos = hotel.name
+        try:
+            at0 = max_time(current_time, "20:00")
+            hp = _poi_price(hotel, 300.0)
+            transports, arrive = _goto(
+                sandbox, pc, target, pos, hotel.name, at0, use_taxi=True,
+            )
+            at1 = add_minutes(arrive, 60)
+            if time_to_minutes(at1) <= time_to_minutes(at0):
+                at1 = add_minutes(at0, 120)
+            rooms = max(1, (pc.people + 1) // 2)
+            activities.append(make_activity(
+                "accommodation", at0, at1,
+                hp * rooms, hp, transports,
+                position=hotel.name, tickets=pc.people,
+                extra={"rooms": rooms, "room_type": 1},
+            ))
+            pos = hotel.name
+        except RuntimeError:
+            pass  # 住宿排不下，跳过
 
     return activities, pos
 
@@ -348,10 +487,12 @@ def build_full_plan_dict(
     itinerary: list[dict] = []
     prev_pos = hotel.name if hotel else ""
     hotel_anchor = prev_pos
+    last_day_end_time = "18:00"  # 追踪最后一天用于返程交通
 
     for day_idx in range(pc.days):
         day_num = day_idx + 1
         acts: list[dict] = []
+        # 每天重置开始时间，防止多日时间累积溢出
         current_time = "09:00"
         skip_breakfast = False
 
@@ -362,12 +503,20 @@ def build_full_plan_dict(
             if go:
                 acts.append(make_intercity_activity(go, pc.people))
                 prev_pos = _intercity_end_position(go, pc.target_city)
-                current_time = add_minutes(
-                    go.get("EndTime") or go.get("end_time") or "10:30", 30,
-                )
+                # 城际到达可能跨午夜，allow_overflow=True
+                raw_end = go.get("EndTime") or go.get("end_time") or "10:30"
+                try:
+                    current_time = add_minutes(raw_end, 30, allow_overflow=True)
+                    # 如果溢出（>23:59），钳制到 09:00 开始下一天
+                    if time_to_minutes(current_time) >= 24 * 60:
+                        current_time = "09:00"
+                except RuntimeError:
+                    current_time = "09:00"
                 skip_breakfast = time_to_minutes(current_time) >= time_to_minutes("10:00")
         else:
+            # Day 2+ 从酒店出发，时间重置为 09:00
             prev_pos = hotel_anchor or prev_pos
+            current_time = "09:00"
 
         day_acts, prev_pos = build_day_activities(
             day_num, pc.days, poi_by_day[day_idx], hotel, meals, pc, sandbox,
@@ -377,20 +526,69 @@ def build_full_plan_dict(
         )
         acts.extend(day_acts)
 
+        # 记录每天最后一个活动时间（用于最后一天返程）
+        for act in reversed(day_acts):
+            if act.get("end_time"):
+                last_day_end_time = act["end_time"]
+                break
+
         if day_idx == pc.days - 1:
-            last_end = "18:00"
-            for act in reversed(day_acts):
-                if act.get("end_time"):
-                    last_end = act["end_time"]
-                    break
-            back_time = max_time(last_end, "18:00")
-            back = sandbox.select_intercity(
-                pc.target_city, pc.start_city, pc.intercity_mode, back_time,
-            )
+            back_time = max_time(last_day_end_time, "18:00")
+            # 先加从最后位置到车站/机场的交通
+            station_name = f"{pc.target_city} Station"
+            if pc.intercity_mode == "airplane":
+                station_name = f"{pc.target_city} Airport"
+            if prev_pos and prev_pos != station_name:
+                try:
+                    station_transports, station_arrive = _goto(
+                        sandbox, pc, pc.target_city, prev_pos, station_name, back_time,
+                    )
+                    if station_transports:
+                        seg_start = station_transports[0]["start_time"]
+                        seg_end = station_transports[-1]["end_time"]
+                        # 从 prev_pos 到车站的 transport（不作为独立 activity，作为返程前的衔接）
+                        back_time = max_time(seg_end, back_time)
+                except RuntimeError:
+                    pass
+
+            # 尝试城际返程，时间溢出则换更早车次
+            back = None
+            for try_earliest in (back_time, "18:00", "16:00", "14:00"):
+                try:
+                    candidate = sandbox.select_intercity(
+                        pc.target_city, pc.start_city, pc.intercity_mode, try_earliest,
+                    )
+                    if candidate:
+                        back = candidate
+                        break
+                except Exception:
+                    continue
             if back:
-                acts.append(make_intercity_activity(back, pc.people, is_return=True))
+                try:
+                    acts.append(make_intercity_activity(back, pc.people, is_return=True))
+                except (ValueError, RuntimeError):
+                    pass  # 缺真实 ID 或时间不可行，跳过返程
 
         itinerary.append({"day": day_num, "activities": acts})
+
+    # 写出前校验时间格式，发现违规直接 fail fast
+    for day_entry in itinerary:
+        for act in day_entry.get("activities", []):
+            for field in ("start_time", "end_time"):
+                t = act.get(field, "")
+                if t and not is_valid_time_format(t):
+                    raise RuntimeError(
+                        f"时间格式违规: day={day_entry.get('day')} type={act.get('type')} "
+                        f"{field}={t!r}（非 HH:MM 两位小时）"
+                    )
+            for seg in act.get("transports", []):
+                for field in ("start_time", "end_time"):
+                    t = seg.get(field, "")
+                    if t and not is_valid_time_format(t):
+                        raise RuntimeError(
+                            f"transport 时间格式违规: day={day_entry.get('day')} "
+                            f"type={act.get('type')} {field}={t!r}"
+                        )
 
     return {
         "people_number": pc.people,
